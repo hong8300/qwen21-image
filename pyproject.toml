@@ -1,0 +1,32 @@
+[project]
+name = "image-workbench"
+version = "0.1.0"
+description = "Local Gradio image generation and editing with Qwen Image 2.1"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "gradio==6.28.0",
+  "torch>=2.8,<3",
+  "torchvision>=0.23",
+  "transformers==5.17.0",
+  "diffusers",
+  "accelerate>=1.10,<2",
+  "pillow>=11,<13",
+  "sentencepiece>=0.2",
+]
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "ruff>=0.12"]
+
+[tool.uv.sources]
+diffusers = { git = "https://github.com/huggingface/diffusers", rev = "80c7ed262aeffbeb43ef13ae04baeb9b84515a69" }
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "B", "UP"]
+ignore = ["B008"]  # Gradio injects Progress through function defaults.
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
