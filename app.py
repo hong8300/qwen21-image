@@ -8,7 +8,7 @@ os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
 
 import gradio as gr  # noqa: E402
 
-from backend import GenerationOptions, ModelManager  # noqa: E402
+from backend import DEFAULT_HEIGHT, DEFAULT_WIDTH, GenerationOptions, ModelManager  # noqa: E402
 
 manager = ModelManager()
 logger = logging.getLogger(__name__)
@@ -78,12 +78,21 @@ def build_app():
                     )
                     with gr.Accordion("生成設定", open=True):
                         with gr.Row():
-                            width = gr.Slider(256, 3072, value=1024, step=32, label="幅 (px)")
-                            height = gr.Slider(256, 3072, value=1024, step=32, label="高さ (px)")
+                            width = gr.Slider(
+                                256, 3072, value=DEFAULT_WIDTH, step=32, label="幅 (px)",
+                                min_width=240,
+                            )
+                            height = gr.Slider(
+                                256, 3072, value=DEFAULT_HEIGHT, step=32, label="高さ (px)",
+                                min_width=240,
+                            )
                         steps = gr.Slider(1, 100, value=40, step=1, label="ステップ数")
                         seed = gr.Number(value=-1, precision=0, label="シード（-1: ランダム）")
                         transparent = gr.Checkbox(label="透明背景を指示する（RGBA）")
-                        gr.Markdown("まずは 1024 px を推奨。大きい画像は時間とメモリを多く使います。")
+                        gr.Markdown(
+                            f"初期サイズは {DEFAULT_WIDTH}×{DEFAULT_HEIGHT} px（幅×高さ）です。"
+                            "大きい画像は時間とメモリを多く使います。"
+                        )
                     run = gr.Button("画像を生成", variant="primary")
                 with gr.Column():
                     output = gr.Image(

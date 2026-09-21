@@ -19,14 +19,16 @@ os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 from PIL import Image, ImageOps  # noqa: E402
 
 IMAGE_MODEL = "Qwen/Qwen-Image-2.1"
+DEFAULT_WIDTH = 1024
+DEFAULT_HEIGHT = 768
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", Path(__file__).parent / "outputs")).resolve()
 
 
 @dataclass(frozen=True)
 class GenerationOptions:
     prompt: str
-    width: int = 1024
-    height: int = 1024
+    width: int = DEFAULT_WIDTH
+    height: int = DEFAULT_HEIGHT
     steps: int = 40
     seed: int = -1
     transparent: bool = False
