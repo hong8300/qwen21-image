@@ -1,6 +1,8 @@
-# Image Workbench
+# Image Workbench for Mac
 
-Qwen Image 2.1 の画像編集・画像生成を利用する日本語 Gradio アプリです。推論はローカルで実行します。
+**Mac（macOS / Apple Silicon）向けの画像編集・画像生成アプリです。**
+
+Qwen Image 2.1 を日本語の Gradio 画面から利用し、Apple Silicon の GPU（MPS）で Mac 上のローカル推論を実行します。Apple Silicon / メモリ 128 GB の環境で動作確認済みです。必要なメモリは生成設定によって変わります。
 
 ## 起動
 
