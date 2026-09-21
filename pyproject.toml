@@ -12,6 +12,7 @@ dependencies = [
   "accelerate>=1.10,<2",
   "pillow>=11,<13",
   "sentencepiece>=0.2",
+  "huggingface-hub>=1,<2",
 ]
 
 [dependency-groups]

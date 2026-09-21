@@ -43,6 +43,15 @@ def generate_image(
         handle_error(error)
 
 
+def enhance_prompt(task, references, prompt, progress=gr.Progress()):
+    try:
+        if task != "Image to Image":
+            raise ValueError("編集指示の補助は Image to Image モードで利用してください。")
+        return manager.rewrite_prompt(references or [], prompt, progress)
+    except Exception as error:
+        handle_error(error)
+
+
 def build_app():
     with gr.Blocks(title="Image Workbench", delete_cache=(3600, 86400)) as demo:
         gr.Markdown(
@@ -69,6 +78,13 @@ def build_app():
                         label="編集・生成の指示", lines=4,
                         placeholder="例：人物の顔と服を保ったまま、背景を夕暮れの海辺に変えてください。",
                     )
+                    with gr.Group() as enhancement_controls:
+                        enhance = gr.Button("編集指示を整える")
+                        gr.Markdown(
+                            "参照画像と指示をもとに、補助モデルが上の指示文を書き直します。"
+                            "内容を確認・修正してから「画像を生成」を押してください。\n\n"
+                            "初回のみ約 18.8 GB の追加ダウンロードが必要です。"
+                        )
                     gr.Examples(
                         examples=[
                             ["背景を夕暮れの海辺に変更。人物の顔・服・構図は維持してください。"],
@@ -106,8 +122,13 @@ def build_app():
                 lambda mode, paths: (
                     gr.File(visible=mode == "Image to Image"),
                     gr.Gallery(visible=mode == "Image to Image" and bool(paths)),
+                    gr.Group(visible=mode == "Image to Image"),
                 ),
-                [task, references], [references, preview], queue=False,
+                [task, references], [references, preview, enhancement_controls], queue=False,
+            )
+            enhance.click(
+                enhance_prompt, [task, references, prompt], prompt,
+                concurrency_limit=1, concurrency_id="inference", api_name="enhance_prompt",
             )
             references.change(
                 lambda paths, mode: gr.Gallery(
@@ -125,7 +146,9 @@ def build_app():
         with gr.Accordion("モデル・保存先", open=False):
             gr.Markdown(
                 "生成した PNG と設定 JSON は `outputs/` に保存されます。\n\n"
-                "モデル: [Qwen Image 2.1](https://huggingface.co/Qwen/Qwen-Image-2.1)"
+                "モデル: [Qwen Image 2.1](https://huggingface.co/Qwen/Qwen-Image-2.1)\n\n"
+                "編集指示の補助: "
+                "[Qwen-Image-2.1-PE-I2I](https://huggingface.co/Qwen/Qwen-Image-2.1-PE-I2I)"
             )
             unload = gr.Button("モデルを解放")
             status = gr.Textbox(label="状態", interactive=False)

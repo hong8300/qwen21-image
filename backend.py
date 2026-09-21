@@ -18,6 +18,8 @@ os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
 from PIL import Image, ImageOps  # noqa: E402
 
+from prompt_enhancer import PromptEnhancer  # noqa: E402
+
 IMAGE_MODEL = "Qwen/Qwen-Image-2.1"
 DEFAULT_WIDTH = 1024
 DEFAULT_HEIGHT = 768
@@ -67,6 +69,7 @@ class ModelManager:
         self.lock = threading.RLock()
         self.pipeline = None
         self.device = None
+        self.enhancer = PromptEnhancer()
 
     def select_device(self) -> str:
         import torch
@@ -90,6 +93,7 @@ class ModelManager:
         import torch
 
         self.pipeline = None
+        self.enhancer.unload()
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -100,6 +104,25 @@ class ModelManager:
         with self.lock:
             self._release()
         return "モデルを解放しました。次回の実行時に再読み込みします。"
+
+    def rewrite_prompt(
+        self, paths: list[str], prompt: str,
+        progress: Callable = lambda *args, **kwargs: None,
+    ) -> str:
+        if not prompt.strip():
+            raise ValueError("編集指示を入力してください。")
+        if not 1 <= len(paths) <= 10:
+            raise ValueError("編集する参照画像を 1〜10 枚アップロードしてください。")
+        images = [read_image(path) for path in paths]
+        with self.lock:
+            # Keep only one large model in memory at a time, including on MPS.
+            self._release()
+            try:
+                device = self.select_device()
+                progress(0, desc="編集指示を整えています（初回は補助モデルをダウンロードします）")
+                return self.enhancer.rewrite(images, prompt.strip(), device)
+            finally:
+                self._release()
 
     def load_pipeline(self):
         if self.pipeline is None:
