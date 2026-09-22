@@ -9,6 +9,7 @@ os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
 import gradio as gr  # noqa: E402
 
 from backend import DEFAULT_HEIGHT, DEFAULT_WIDTH, GenerationOptions, ModelManager  # noqa: E402
+from prompt_enhancer import IncompleteRewrite  # noqa: E402
 
 manager = ModelManager()
 logger = logging.getLogger(__name__)
@@ -48,6 +49,9 @@ def enhance_prompt(task, references, prompt, thorough=False, progress=gr.Progres
         if task != "Image to Image":
             raise ValueError("編集指示の補助は Image to Image モードで利用してください。")
         return manager.rewrite_prompt(references or [], prompt, progress, thorough=thorough)
+    except IncompleteRewrite as error:
+        gr.Warning(str(error), duration=12)
+        return gr.skip()
     except Exception as error:
         handle_error(error)
 
@@ -96,6 +100,8 @@ def build_app():
                         gr.Markdown(
                             "参照画像と指示をもとに、補助モデルが上の指示文を書き直します。"
                             "内容を確認・修正してから「画像を生成」を押してください。\n\n"
+                            "通常モードは短い指示に整理し、補助モデルに渡す画像の解像度を抑えます。"
+                            "細部を詳しく検討したい場合は上のチェックをオンにしてください。\n\n"
                             "初回のみ約 18.8 GB の追加ダウンロードが必要です。"
                             "同じ画像・指示での再実行は前回の結果を再利用します。"
                         )

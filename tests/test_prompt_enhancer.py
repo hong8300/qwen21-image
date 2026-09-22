@@ -7,7 +7,11 @@ from PIL import Image
 
 import app
 from backend import ModelManager
-from prompt_enhancer import PromptEnhancer, parse_rewritten_prompt
+from prompt_enhancer import (
+    FAST_MAX_TOKENS, FAST_PREFIX, FAST_SYSTEM_PROMPT, FAST_TOTAL_PIXELS,
+    IncompleteRewrite, PromptEnhancer, RewriteMonitor, fast_image_options,
+    parse_fast_prompt, parse_rewritten_prompt,
+)
 
 
 @pytest.mark.parametrize("answer", [
@@ -44,14 +48,27 @@ def test_rewrite_preserves_image_order_and_decodes_only_generated_tokens(monkeyp
     def template(messages, **kwargs):
         captured["messages"] = messages
         assert kwargs["enable_thinking"] is thorough
+        if thorough:
+            assert kwargs["add_generation_prompt"] is True
+            assert messages[0]["content"][0]["text"] == "Official instructions"
+        else:
+            assert kwargs["continue_final_message"] is True
+            image_options = kwargs["processor_kwargs"]["images_kwargs"]
+            assert image_options["max_pixels"] == FAST_TOTAL_PIXELS // len(images)
+            assert messages[0]["content"][0]["text"] == FAST_SYSTEM_PROMPT
+            assert messages[-1]["content"][0]["text"] == FAST_PREFIX
         return Inputs(input_ids=torch.tensor([[1, 2, 3]]))
 
     def decode(tokens, **kwargs):
         assert tokens.tolist() == [4, 5]
-        return '<think>reasoning</think>{"rewritten_prompt": "Combine the images."}'
+        return (
+            '<think>reasoning</think>{"rewritten_prompt": "Combine the images."}'
+            if thorough else 'Combine the images.", "unused":'
+        )
 
     def generate(**kwargs):
-        assert kwargs["max_new_tokens"] == (24000 if thorough else 2048)
+        assert kwargs["max_new_tokens"] == (24000 if thorough else FAST_MAX_TOKENS)
+        assert kwargs["do_sample"] is thorough
         return torch.tensor([[1, 2, 3, 4, 5]])
 
     def load(device):
@@ -179,3 +196,94 @@ def test_changed_input_does_not_reuse_stale_result(tmp_path, monkeypatch, change
     assert result == "Edit result 2"
     assert manager.rewrite_stats["cache_hit"] is False
     assert len(manager.rewrite_cache) == 2
+
+
+@pytest.mark.parametrize("tail", ['}', ', "wh_ratio": "', '}, irrelevant trailer'])
+def test_fast_parser_accepts_complete_instruction_without_unused_fields(tail):
+    import json
+
+    instruction = 'Add the title "秋のティータイム"; keep {braces} and a \\ path.'
+    text = '{"rewritten_prompt": ' + json.dumps(instruction, ensure_ascii=False) + tail
+    assert parse_fast_prompt(text) == instruction
+
+
+@pytest.mark.parametrize("text", [
+    FAST_PREFIX + 'unfinished',
+    FAST_PREFIX + 'unfinished escape\\',
+    FAST_PREFIX + 'Add "unescaped text"}',
+    FAST_PREFIX + '"}',
+    '{"rewritten_prompt": null}',
+    FAST_PREFIX + 'No delimiter"',
+    '<think>unfinished reasoning',
+])
+def test_fast_parser_never_returns_truncated_or_malformed_instruction(text):
+    with pytest.raises(ValueError):
+        parse_fast_prompt(text)
+
+
+@pytest.mark.parametrize("thorough", [False, True])
+def test_monitor_stops_complete_field_only_in_fast_mode(thorough):
+    import torch
+
+    tokenizer = SimpleNamespace(decode=lambda *args, **kwargs: 'Make it blue.", "unused":')
+    monitor = RewriteMonitor(tokenizer, 3, thorough, lambda *args, **kwargs: None)
+    assert monitor(torch.zeros((1, 11), dtype=torch.long), None) is (not thorough)
+    assert monitor.reason == (None if thorough else 'complete')
+
+
+def test_monitor_reports_progress_and_stops_runaway_generation(monkeypatch):
+    import torch
+    import prompt_enhancer
+
+    now = [0]
+    monkeypatch.setattr(prompt_enhancer.time, "perf_counter", lambda: now[0])
+    updates = []
+    tokenizer = SimpleNamespace(decode=lambda *args, **kwargs: 'still unfinished')
+    monitor = RewriteMonitor(tokenizer, 3, False, lambda *args, **kwargs: updates.append(kwargs))
+    now[0] = prompt_enhancer.FAST_MAX_SECONDS
+    assert monitor(torch.zeros((1, 11), dtype=torch.long), None) is True
+    assert monitor.reason == "time_budget"
+    assert "8 トークン" in updates[-1]["desc"]
+
+
+def test_incomplete_answer_keeps_textbox_and_warns_instead_of_claiming_success(monkeypatch):
+    notices = []
+
+    def incomplete(*args, **kwargs):
+        raise IncompleteRewrite("Original instruction preserved")
+
+    monkeypatch.setattr(app.manager, "rewrite_prompt", incomplete)
+    monkeypatch.setattr(app.gr, "Warning", lambda text, **kwargs: notices.append(text))
+    assert app.enhance_prompt("Image to Image", ["reference.png"], "Original") == app.gr.skip()
+    assert notices == ["Original instruction preserved"]
+
+
+def test_incomplete_answer_is_not_cached_and_models_are_released(tmp_path, monkeypatch):
+    path = tmp_path / "reference.png"
+    Image.new("RGB", (32, 32)).save(path)
+    manager = ModelManager()
+    monkeypatch.setattr(manager, "select_device", lambda: "cpu")
+
+    def incomplete(*args, **kwargs):
+        manager.enhancer.model = object()
+        raise IncompleteRewrite("Incomplete")
+
+    monkeypatch.setattr(manager.enhancer, "rewrite", incomplete)
+    with pytest.raises(IncompleteRewrite):
+        manager.rewrite_prompt([str(path)], "Edit")
+    assert manager.rewrite_cache == {}
+    assert manager.enhancer.model is None
+
+
+@pytest.mark.parametrize("image_count", [1, 2, 10])
+def test_real_image_processor_respects_fast_pixel_budget(image_count):
+    from transformers import Qwen2VLImageProcessor
+
+    processor = Qwen2VLImageProcessor(
+        size={"shortest_edge": 65536, "longest_edge": 16777216}, patch_size=16,
+    )
+    image = Image.new("RGB", (2048, 3072))
+    result = processor(images=[image], **fast_image_options(image_count), return_tensors="pt")
+    _, rows, columns = result["image_grid_thw"][0].tolist()
+    assert rows * columns * 16 * 16 <= FAST_TOTAL_PIXELS // image_count
+    assert image.size == (2048, 3072)
