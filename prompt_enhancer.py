@@ -195,7 +195,7 @@ class PromptEnhancer:
                 else "eos"
             ),
         }
-        logger.info("Prompt enhancement timings: %s", self.last_stats)
+        logger.debug("Prompt enhancement timings: %s", self.last_stats)
         try:
             return parse_rewritten_prompt(text) if thorough else parse_fast_prompt(FAST_PREFIX + text)
         except ValueError as error:

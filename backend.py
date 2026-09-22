@@ -158,7 +158,7 @@ class ModelManager:
             self._release()
             device = self.select_device()
             dtype = torch.float32 if device == "cpu" else torch.bfloat16
-            pipeline = QwenImage21Pipeline.from_pretrained(IMAGE_MODEL, torch_dtype=dtype)
+            pipeline = QwenImage21Pipeline.from_pretrained(IMAGE_MODEL, dtype=dtype)
             if device == "cuda" and os.getenv("QWEN_CPU_OFFLOAD", "1") == "1":
                 pipeline.enable_model_cpu_offload()
             else:
@@ -188,9 +188,16 @@ class ModelManager:
             started = time.monotonic()
             progress(0, desc="モデルを読み込み中（初回はダウンロードします）")
             pipeline = self.load_pipeline()
+            load_seconds = time.monotonic() - started
+            inference_started = time.monotonic()
+            progress(0.02, desc="指示・参照画像を処理中")
 
             def on_step_end(pipe, step, timestep, callback_kwargs):
-                progress((step + 1) / options.steps, desc=f"生成中 {step + 1}/{options.steps}")
+                if step + 1 == options.steps:
+                    progress(0.9, desc=f"生成 {options.steps}/{options.steps} · 画像を仕上げ中")
+                else:
+                    progress(0.05 + 0.85 * (step + 1) / options.steps,
+                             desc=f"生成中 {step + 1}/{options.steps} ステップ")
                 return callback_kwargs
 
             with torch.inference_mode():
@@ -204,12 +211,17 @@ class ModelManager:
                     generator=torch.Generator(device="cpu").manual_seed(seed),
                     callback_on_step_end=on_step_end,
                 ).images[0]
+            inference_seconds = time.monotonic() - inference_started
+            progress(0.95, desc="生成画像と設定を保存中")
             metadata = {
                 "model": IMAGE_MODEL, "task": "image-to-image" if images else "text-to-image",
                 "prompt": options.prompt, "effective_prompt": prompt, "seed": seed,
                 "width": result.width, "height": result.height, "steps": options.steps,
                 "mode": result.mode, "reference_count": len(images), "device": self.device,
                 "elapsed_seconds": round(time.monotonic() - started, 2),
+                "load_seconds": round(load_seconds, 2),
+                "inference_seconds": round(inference_seconds, 2),
             }
             image_path, metadata_path = save_result(result, metadata)
+            progress(1, desc="画像と設定の保存が完了しました")
             return image_path, metadata_path, metadata

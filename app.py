@@ -9,6 +9,7 @@ os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
 import gradio as gr  # noqa: E402
 
 from backend import DEFAULT_HEIGHT, DEFAULT_WIDTH, GenerationOptions, ModelManager  # noqa: E402
+from execution import configure_logging, format_seconds, stream_execution  # noqa: E402
 from prompt_enhancer import IncompleteRewrite  # noqa: E402
 
 manager = ModelManager()
@@ -46,14 +47,77 @@ def generate_image(
 
 def enhance_prompt(task, references, prompt, thorough=False, progress=gr.Progress()):
     try:
-        if task != "Image to Image":
-            raise ValueError("編集指示の補助は Image to Image モードで利用してください。")
-        return manager.rewrite_prompt(references or [], prompt, progress, thorough=thorough)
+        return rewrite_instruction(task, references, prompt, thorough, progress)
     except IncompleteRewrite as error:
         gr.Warning(str(error), duration=12)
         return gr.skip()
     except Exception as error:
         handle_error(error)
+
+
+def rewrite_instruction(task, references, prompt, thorough, progress):
+    if task != "Image to Image":
+        raise ValueError("編集指示の補助は Image to Image モードで利用してください。")
+    return manager.rewrite_prompt(references or [], prompt, progress, thorough=thorough)
+
+
+def stream_generate_image(task, references, prompt, width, height, steps, seed, transparent):
+    def operation(progress):
+        return generate_image(
+            task, references, prompt, width, height, steps, seed, transparent, progress,
+        )
+
+    for update in stream_execution("画像生成", operation):
+        result = (gr.skip(), gr.skip(), gr.skip())
+        duration = gr.skip()
+        status = update.status
+        if update.done:
+            duration = f"{'失敗' if update.error else '完了'} · {format_seconds(update.elapsed)}"
+            if update.error:
+                status = f"画像生成に失敗: {update.error} · {format_seconds(update.elapsed)}"
+            else:
+                result = update.result
+                metadata = result[2]
+                duration += (
+                    f"（読込 {format_seconds(metadata.get('load_seconds', 0))} / "
+                    f"生成 {format_seconds(metadata.get('inference_seconds', 0))}）"
+                )
+        yield *result, status, duration, update.log
+    if update.error:
+        raise gr.Error(str(update.error))
+
+
+def stream_enhance_prompt(task, references, prompt, thorough=False):
+    def operation(progress):
+        with manager.lock:
+            rewritten = rewrite_instruction(task, references, prompt, thorough, progress)
+            return rewritten, dict(manager.rewrite_stats)
+
+    for update in stream_execution("編集指示を整える", operation):
+        result, duration = gr.skip(), gr.skip()
+        status = update.status
+        if update.done:
+            if update.error:
+                outcome = "未完了・元の指示を保持" if isinstance(
+                    update.error, IncompleteRewrite,
+                ) else "失敗"
+                duration = f"{outcome} · {format_seconds(update.elapsed)}"
+                status = f"編集指示を整える: {duration} · {update.error}"
+            else:
+                result, stats = update.result
+                duration = f"完了 · {format_seconds(update.elapsed)}"
+                if stats.get("cache_hit"):
+                    duration += "（前回の結果を再利用）"
+                else:
+                    duration += (
+                        f"（読込 {format_seconds(stats.get('load_seconds', 0))} / "
+                        f"指示作成 {format_seconds(stats.get('generate_seconds', 0))}）"
+                    )
+        yield result, status, duration, update.log
+    if isinstance(update.error, IncompleteRewrite):
+        gr.Warning(str(update.error), duration=12)
+    elif update.error:
+        raise gr.Error(str(update.error))
 
 
 def update_reference_preview(paths, mode):
@@ -65,6 +129,7 @@ def update_reference_preview(paths, mode):
 
 
 def build_app():
+    configure_logging()
     with gr.Blocks(title="Image Workbench", delete_cache=(3600, 86400)) as demo:
         gr.Markdown(
             "# Image Workbench\n"
@@ -132,12 +197,30 @@ def build_app():
                         )
                     run = gr.Button("画像を生成", variant="primary")
                 with gr.Column():
+                    run_status = gr.Textbox(
+                        label="進行状況", value="待機中", lines=2, interactive=False,
+                        elem_id="run-status",
+                    )
                     output = gr.Image(
                         label="生成結果", type="filepath", format="png", image_mode="RGBA",
                         interactive=False, height=520,
                         buttons=["download", "fullscreen"], elem_id="generated-image",
                     )
                     files = gr.File(label="PNG・生成設定をダウンロード", file_count="multiple")
+                    generation_time = gr.Textbox(
+                        label="画像生成の所要時間（直近）", value="未実行", interactive=False,
+                        elem_id="generation-time",
+                    )
+                    enhancement_time = gr.Textbox(
+                        label="指示を整える所要時間（直近）", value="未実行", interactive=False,
+                        elem_id="enhancement-time",
+                    )
+                    with gr.Accordion("実行ログ", open=False):
+                        gr.Markdown("この実行の進捗・警告・エラーを表示します。")
+                        run_log = gr.Textbox(
+                            label="ログ（最新200行）", lines=12, max_lines=20, interactive=False,
+                            autoscroll=True, buttons=["copy"], elem_id="run-log",
+                        )
                     with gr.Accordion("生成情報", open=False):
                         info = gr.JSON(label="設定と実行結果")
             task.change(
@@ -149,8 +232,10 @@ def build_app():
                 [task, references], [references, preview, enhancement_controls], queue=False,
             )
             enhance.click(
-                enhance_prompt, [task, references, prompt, thorough], prompt,
+                stream_enhance_prompt, [task, references, prompt, thorough],
+                [prompt, run_status, enhancement_time, run_log],
                 concurrency_limit=1, concurrency_id="inference", api_name="enhance_prompt",
+                show_progress="minimal",
             )
             references.change(
                 update_reference_preview,
@@ -161,9 +246,10 @@ def build_app():
                 queue=False, api_name="swap_dimensions",
             )
             run.click(
-                generate_image,
+                stream_generate_image,
                 [task, references, prompt, width, height, steps, seed, transparent],
-                [output, files, info], concurrency_limit=1, concurrency_id="inference",
+                [output, files, info, run_status, generation_time, run_log],
+                concurrency_limit=1, concurrency_id="inference", show_progress="minimal",
                 api_name="generate_image",
             )
         with gr.Accordion("モデル・保存先", open=False):
@@ -184,7 +270,7 @@ if __name__ == "__main__":
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=7860)
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO)
+    configure_logging()
     build_app().launch(
         server_name=args.host, server_port=args.port, share=False,
         theme=gr.themes.Soft(primary_hue="teal"),
