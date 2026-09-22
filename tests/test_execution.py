@@ -167,3 +167,76 @@ def test_generation_success_displays_load_and_inference_times(monkeypatch):
 def test_duration_formats_minutes_and_fast_cache_hits():
     assert format_seconds(0.03) == "0.03 秒"
     assert format_seconds(123.4) == "2 分 3.4 秒"
+
+
+@pytest.mark.parametrize("cache_hit", [False, True])
+def test_combined_rewrites_then_generates_with_same_settings(monkeypatch, cache_hit):
+    calls = []
+
+    def rewrite(paths, prompt, progress, thorough=False):
+        calls.append(("rewrite", paths, prompt, thorough))
+        progress(0.5, desc="Rewriting")
+        app.manager.rewrite_stats = {"cache_hit": cache_hit}
+        return "Rewritten"
+
+    def generate(task, refs, prompt, width, height, steps, seed, transparent, progress):
+        calls.append(("generate", task, refs, prompt, width, height, steps, seed, transparent))
+        progress(1, desc="Saving")
+        return "output.png", ["output.png", "meta.json"], {"inference_seconds": 2}
+
+    monkeypatch.setattr(app.manager, "rewrite_prompt", rewrite)
+    monkeypatch.setattr(app, "generate_image", generate)
+    final = list(app.stream_enhance_and_generate(
+        "Image to Image", ["ref.png"], "Original", 768, 1024, 20, 42, True, True,
+    ))[-1]
+    assert calls == [
+        ("rewrite", ["ref.png"], "Original", True),
+        ("generate", "Image to Image", ["ref.png"], "Rewritten", 768, 1024, 20, 42, True),
+    ]
+    assert final[:2] == ("Rewritten", "output.png")
+    assert 'data-state="success"' in final[4]
+    assert "完了" in final[5] and "完了" in final[6]
+    assert ("再利用" in final[6]) is cache_hit
+    assert "1/2" in final[7] and "2/2" in final[7]
+
+
+@pytest.mark.parametrize("error", [IncompleteRewrite("unfinished"), RuntimeError("rewrite failed")])
+def test_combined_does_not_generate_if_rewrite_fails(monkeypatch, error):
+    def rewrite(*args, **kwargs):
+        raise error
+
+    def generate(*args, **kwargs):
+        pytest.fail("Generation must not start after a failed rewrite")
+
+    monkeypatch.setattr(app.manager, "rewrite_prompt", rewrite)
+    monkeypatch.setattr(app, "generate_image", generate)
+    monkeypatch.setattr(app.gr, "Warning", lambda *args, **kwargs: None)
+    stream = app.stream_enhance_and_generate("Image to Image", ["ref.png"], "Original", 256, 256, 1, 1, False)
+    updates = []
+    if isinstance(error, IncompleteRewrite):
+        updates = list(stream)
+    else:
+        with pytest.raises(app.gr.Error, match="rewrite failed"):
+            updates.extend(stream)
+    final = updates[-1]
+    assert final[:4] == (app.gr.skip(),) * 4
+    assert final[5] == "未実行（指示整理で停止）"
+    assert str(error) in final[7]
+
+
+def test_combined_keeps_rewritten_prompt_when_generation_fails(monkeypatch):
+    monkeypatch.setattr(app.manager, "rewrite_prompt", lambda *args, **kwargs: "Rewritten")
+
+    def generate(*args):
+        raise RuntimeError("generation failed")
+
+    monkeypatch.setattr(app, "generate_image", generate)
+    updates = []
+    with pytest.raises(app.gr.Error, match="generation failed"):
+        updates.extend(app.stream_enhance_and_generate(
+            "Image to Image", ["ref.png"], "Original", 256, 256, 1, 1, False,
+        ))
+    final = updates[-1]
+    assert final[0] == "Rewritten"
+    assert final[1:4] == (app.gr.skip(),) * 3
+    assert "失敗" in final[5] and "完了" in final[6]

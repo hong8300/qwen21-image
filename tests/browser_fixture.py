@@ -15,6 +15,8 @@ for color in ["red", "blue", "green"]:
 
 
 def generate(paths, options, progress):
+    with (root / "generate-calls.txt").open("a") as calls:
+        calls.write(options.prompt + "\n")
     progress(0, desc="モデルを読み込み中")
     time.sleep(0.5)
     for step in range(80):
@@ -23,6 +25,7 @@ def generate(paths, options, progress):
     if "FAIL" in options.prompt:
         raise RuntimeError("Test generation failure")
     metadata = {
+        "prompt": options.prompt,
         "width": options.width,
         "height": options.height,
         "load_seconds": 0.5,

@@ -22,7 +22,7 @@ def check_ui(url, root):
     expect.set_options(timeout=15000)
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        page = browser.new_page(viewport={"width": 1440, "height": 1100})
+        page = browser.new_page(viewport={"width": 1440, "height": 800})
         page.set_default_timeout(15000)
         errors = []
         page.on("pageerror", lambda e: errors.append(str(e)))
@@ -30,6 +30,20 @@ def check_ui(url, root):
         run = page.locator("#generate-button")
         prompt = page.locator("#instruction textarea")
         expect(run).to_be_disabled()
+        example = page.get_by_text("A small ceramic fox on a wooden desk, soft morning light.", exact=True)
+        expect(example).not_to_be_visible()
+        page.locator("#examples button").first.click()
+        expect(example).to_be_visible()
+        example.click()
+        expect(prompt).to_have_value("A small ceramic fox on a wooden desk, soft morning light.")
+        page.locator("#examples button").first.click()
+        prompt.fill("")
+        expect(example).not_to_be_visible()
+        for width in (1440, 1280):
+            page.set_viewport_size({"width": width, "height": 800})
+            bounds = page.locator("#enhance-button").bounding_box()
+            assert bounds["y"] + bounds["height"] <= 800, bounds
+        page.set_viewport_size({"width": 1440, "height": 800})
         disabled_color = run.evaluate("(e)=>getComputedStyle(e).backgroundColor")
 
         def drop(name):
@@ -75,6 +89,24 @@ def check_ui(url, root):
         page.wait_for_function(
             "()=>getComputedStyle(document.querySelector('#generate-button')).backgroundColor==='rgb(254, 243, 199)'"
         )
+        def contrast(selector):
+            return page.locator(selector).evaluate(r"""e => {
+                const rgb = s => s.match(/[\d.]+/g).slice(0,3).map(Number);
+                const lum = s => rgb(s).map(v => {v/=255; return v<=.04045 ? v/12.92 : ((v+.055)/1.055)**2.4;})
+                    .reduce((sum,v,i)=>sum+v*[.2126,.7152,.0722][i],0);
+                let parent=e;
+                while(getComputedStyle(parent).backgroundColor==='rgba(0, 0, 0, 0)') parent=parent.parentElement;
+                const a=lum(getComputedStyle(e).color), b=lum(getComputedStyle(parent).backgroundColor);
+                return (Math.max(a,b)+.05)/(Math.min(a,b)+.05);
+            }""")
+
+        contrasts = {}
+        for theme in ("dark", "light"):
+            page.evaluate("theme => document.documentElement.classList.toggle('dark', theme==='dark')", theme)
+            for selector in ("#generate-button", "#run-status strong", "#run-status .status-detail"):
+                ratio = contrast(selector)
+                assert ratio >= 4.5, (theme, selector, ratio)
+                contrasts[f"{theme} {selector}"] = round(ratio, 2)
         busy_color = run.evaluate("(e)=>getComputedStyle(e).backgroundColor")
         assert busy_color != disabled_color
         page.wait_for_function(
@@ -152,7 +184,49 @@ def check_ui(url, root):
         expect(page.locator('#run-status [data-state="success"]')).to_be_visible()
         expect(page.locator("#enhance-button")).to_be_enabled()
         expect(prompt).to_have_value("Rewritten: Final edit")
+        # The combined action must use the rewritten prompt without a second click.
+        combined = page.locator("#combined-button")
+        prompt.fill("Automatic edit")
+        combined.click()
+        expect(page.locator('#run-status [data-operation="combined-enhance"]')).to_be_visible()
+        expect(combined).to_be_disabled()
+        expect(prompt).not_to_be_editable()
+        expect(page.locator('#run-status [data-operation="combined-generate"]')).to_be_visible()
+        expect(combined).to_be_disabled()
+        expect(prompt).to_have_value("Rewritten: Automatic edit")
+        assert contrast("#combined-button") >= 4.5
+        expect(page.locator('#run-status [data-state="success"]')).to_be_visible()
+        expect(combined).to_be_enabled()
+        assert json.loads((root / "result.json").read_text())["prompt"] == "Rewritten: Automatic edit"
+        expect(page.locator("#generation-time textarea")).to_have_value(re.compile("完了"))
+        expect(page.locator("#enhancement-time textarea")).to_have_value(re.compile("完了"))
+        assert "1/2" in page.locator("#run-log textarea").input_value()
+        assert "2/2" in page.locator("#run-log textarea").input_value()
+        calls = (root / "generate-calls.txt").read_text()
+        prompt.fill("INCOMPLETE automatic")
+        combined.click()
+        expect(page.locator('#run-status [data-state="warning"]')).to_be_visible()
+        expect(combined).to_be_enabled()
+        expect(prompt).to_have_value("INCOMPLETE automatic")
+        assert (root / "generate-calls.txt").read_text() == calls
+        expect(page.locator("#generation-time textarea")).to_have_value(re.compile("未実行"))
+        prompt.fill("FAIL automatic")
+        combined.click()
+        expect(page.locator('#run-status [data-state="error"]')).to_be_visible()
+        expect(combined).to_be_enabled()
+        expect(prompt).to_have_value("Rewritten: FAIL automatic")
+        # Capture a clean completed screen with secondary panels collapsed.
+        prompt.fill("Final automatic edit")
+        combined.click()
+        expect(page.locator('#run-status [data-state="success"]')).to_be_visible()
+        expect(combined).to_be_enabled()
+        page.get_by_role("button", name=re.compile("^実行ログ")).click()
+        expect(page.get_by_text("実行に失敗しました: Test generation failure", exact=True)).not_to_be_visible()
+        page.evaluate("scrollTo(0,0)")
         page.screenshot(path=str(root / "complete.png"), full_page=True)
+        page.evaluate("document.documentElement.classList.add('dark')")
+        page.screenshot(path=str(root / "dark.png"), full_page=True)
+        page.evaluate("document.documentElement.classList.remove('dark')")
         page.set_viewport_size({"width": 390, "height": 844})
         assert page.evaluate("document.documentElement.scrollWidth <= innerWidth + 2")
         page.screenshot(path=str(root / "mobile.png"), full_page=True)
@@ -165,6 +239,7 @@ def check_ui(url, root):
                     "enabled_color": enabled_color,
                     "busy_color": busy_color,
                     "browser_errors": errors,
+                    "contrast_ratios": contrasts,
                 },
                 ensure_ascii=False,
             )
@@ -206,7 +281,7 @@ def main():
                     target = Path(artifact_dir)
                     target.mkdir(parents=True, exist_ok=True)
                     for image in root.glob("*.png"):
-                        if image.name in {"running.png", "complete.png", "mobile.png"}:
+                        if image.name in {"running.png", "complete.png", "mobile.png", "dark.png"}:
                             shutil.copy2(image, target / image.name)
             finally:
                 process.terminate()

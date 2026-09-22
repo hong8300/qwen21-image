@@ -40,6 +40,7 @@ def test_generated_image_can_become_next_edit_input():
 def test_actions_require_valid_inputs(mode, refs, prompt, generate, enhance):
     allowed = action_availability(mode, refs, prompt, None)
     assert allowed["generate"] is generate and allowed["enhance"] is enhance
+    assert allowed["combined"] is enhance
     assert allowed["reason"]
 
 
@@ -47,7 +48,7 @@ def test_all_mutating_actions_are_blocked_during_inference_and_restored_afterwar
     args = ("Image to Image", ["ref.png"], "Edit", "output.png")
     busy = action_availability(*args, busy=True)
     ready = action_availability(*args, busy=False)
-    for key in ["generate", "enhance", "clear", "reuse", "edit"]:
+    for key in ["generate", "enhance", "combined", "clear", "reuse", "edit"]:
         assert busy[key] is False and ready[key] is True
 
 

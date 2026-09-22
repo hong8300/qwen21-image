@@ -10,7 +10,7 @@ def status_card(state, message, operation=""):
     }
     label = labels[state]
     if state == "running":
-        label = "現在生成中" if operation == "generate" else "現在指示を整理中"
+        label = "現在生成中" if operation.endswith("generate") else "現在指示を整理中"
     return (
         f'<div class="status-card" data-state="{state}" data-operation="{operation}" '
         f'role="status" aria-live="polite" aria-atomic="true">'
@@ -33,6 +33,7 @@ def action_availability(mode, paths, prompt, output, busy=False):
         reason = "準備できました。青緑のボタンから実行できます。"
     return {
         "generate": not busy and prompt_ok and (not image_mode or references_ok),
+        "combined": not busy and prompt_ok and image_mode and references_ok,
         "enhance": not busy and prompt_ok and image_mode and references_ok,
         "clear": not busy and bool(paths),
         "reuse": not busy and bool(output),
@@ -52,7 +53,7 @@ def combine_references(uploaded, current, mode):
 
 UI_CSS = """
 .status-card {
-  display: flex; flex-direction: column; gap: 8px; padding: 16px 18px;
+  display: flex; flex-direction: column; gap: 4px; padding: 10px 14px;
   border: 2px solid #94a3b8; border-radius: 12px; background: #f1f5f9; color: #334155;
 }
 .status-card strong { display: flex; align-items: center; gap: 10px; font-size: 18px; }
@@ -70,14 +71,22 @@ button.wb-action { min-height: 44px; font-weight: 650; border: 1px solid #0f766e
 button.wb-action:not(:disabled) { color: white; background: #0f766e; cursor: pointer; }
 button.wb-action:not(:disabled):hover { background: #115e59; }
 button.wb-action:disabled {
-  color: #64748b !important; background: #e2e8f0 !important; border-color: #cbd5e1 !important;
+  color: #475569 !important; background: #e2e8f0 !important; border-color: #cbd5e1 !important;
   opacity: 1 !important; cursor: not-allowed;
 }
 button.wb-action:focus-visible { outline: 3px solid #0ea5e9; outline-offset: 3px; }
 body:has(.status-card[data-operation="generate"][data-state="running"]) #generate-button,
-body:has(.status-card[data-operation="enhance"][data-state="running"]) #enhance-button {
+body:has(.status-card[data-operation="enhance"][data-state="running"]) #enhance-button,
+body:has(.status-card[data-operation^="combined-"][data-state="running"]) #combined-button {
   color: #854d0e !important; background: #fef3c7 !important; border-color: #d97706 !important;
 }
+button.wb-action * { color: inherit !important; }
+#run-status .status-card * { color: inherit !important; }
+.gradio-container { max-width: 1440px !important; --layout-gap: 10px; }
+#workspace, #workspace .gr-form, #workspace .gap { gap: 10px; }
+#app-heading h1 { margin-bottom: 2px; font-size: 24px; }
+#app-heading p { margin: 0; }
+#action-hint p, #reference-count p { margin: 0; font-size: 13px; }
 #reference-upload { border: 2px dashed #0f766e; border-radius: 12px; }
 #reference-count { margin-top: 4px; }
 #run-log textarea { height: 280px !important; max-height: 280px !important;

@@ -3,6 +3,8 @@
 import argparse
 import logging
 import os
+import threading
+import time
 
 os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
 
@@ -129,6 +131,79 @@ def stream_enhance_prompt(task, references, prompt, thorough=False):
         raise gr.Error(str(update.error))
 
 
+def stream_enhance_and_generate(
+    task, references, prompt, width, height, steps, seed, transparent, thorough=False,
+):
+    phase_lock = threading.Lock()
+    phase = {"name": "enhance", "started": None, "prompt": gr.skip(),
+             "enhancement_time": "処理中", "generation_time": "指示整理の完了待ち"}
+
+    def operation(progress):
+        with manager.lock:
+            started = time.monotonic()
+            with phase_lock:
+                phase["started"] = started
+            progress(0, desc="1/2 編集指示を整えています")
+            rewritten = rewrite_instruction(
+                task, references, prompt, thorough,
+                lambda value=None, desc=None, **kw: progress(value, desc=f"1/2 指示整理 · {desc or ''}"),
+            )
+            stats = dict(manager.rewrite_stats)
+            duration = f"完了 · {format_seconds(time.monotonic() - started)}"
+            duration += "（前回の結果を再利用）" if stats.get("cache_hit") else (
+                f"（読込 {format_seconds(stats.get('load_seconds', 0))} / "
+                f"指示作成 {format_seconds(stats.get('generate_seconds', 0))}）"
+            )
+            logger.info("1/2 編集指示: %s", duration)
+            with phase_lock:
+                phase.update(name="generate", started=time.monotonic(), prompt=rewritten,
+                             enhancement_time=duration, generation_time="処理中")
+            progress(0, desc="2/2 整えた指示で画像を生成しています")
+            result = generate_image(
+                task, references, rewritten, width, height, steps, seed, transparent,
+                lambda value=None, desc=None, **kw: progress(value, desc=f"2/2 画像生成 · {desc or ''}"),
+            )
+            metadata = result[2]
+            with phase_lock:
+                phase["generation_time"] = (
+                    f"完了 · {format_seconds(time.monotonic() - phase['started'])}"
+                    f"（読込 {format_seconds(metadata.get('load_seconds', 0))} / "
+                    f"生成 {format_seconds(metadata.get('inference_seconds', 0))}）"
+                )
+            return result
+
+    for update in stream_execution("指示整理 → 画像生成", operation):
+        with phase_lock:
+            current = dict(phase)
+        state, status = "running", update.status
+        result = (gr.skip(),) * 3
+        incomplete = isinstance(update.error, IncompleteRewrite)
+        if update.done:
+            state = "warning" if incomplete else ("error" if update.error else "success")
+            if update.error:
+                duration = format_seconds(time.monotonic() - current["started"]) if current[
+                    "started"
+                ] is not None else format_seconds(update.elapsed)
+                if current["name"] == "enhance":
+                    current["enhancement_time"] = f"{'未完了・元の指示を保持' if incomplete else '失敗'} · {duration}"
+                    current["generation_time"] = "未実行（指示整理で停止）"
+                else:
+                    current["generation_time"] = f"失敗 · {duration}"
+                status = f"処理を停止: {update.error} · 合計 {format_seconds(update.elapsed)}"
+            else:
+                result = update.result
+                status = f"指示整理・画像生成が完了 · 合計 {format_seconds(update.elapsed)}"
+        yield (
+            current["prompt"], *result,
+            status_card(state, status, "combined-" + current["name"]),
+            current["generation_time"], current["enhancement_time"], update.log,
+        )
+    if isinstance(update.error, IncompleteRewrite):
+        gr.Warning(str(update.error), duration=12)
+    elif update.error:
+        raise gr.Error(str(update.error))
+
+
 def update_reference_preview(paths, mode):
     return gr.update(
         value=[(path, f"Image {i + 1}") for i, path in enumerate(paths or [])],
@@ -156,64 +231,87 @@ def reuse_generated_image(path):
 def build_app():
     configure_logging()
     with gr.Blocks(title="Image Workbench", delete_cache=(3600, 86400)) as demo:
-        gr.Markdown(
-            "# Image Workbench\n"
-            "Qwen Image 2.1 で、画像を編集・文章から画像を生成。\n\n"
-            "ローカル推論 · 初回実行時にモデルをダウンロードします。"
-        )
-        with gr.Tab("画像編集・生成"):
+        gr.Markdown("# Image Workbench\nQwen Image 2.1 · Macでローカル画像編集・生成", elem_id="app-heading")
+        with gr.Column(elem_id="editor"):
             busy = gr.State(False)
             active_operation = gr.State("")
             references = gr.File(file_count="multiple", visible=False, interactive=False)
-            with gr.Row():
-                with gr.Column():
+            with gr.Row(elem_id="workspace"):
+                with gr.Column(min_width=320):
                     task = gr.Radio(
                         ["Image to Image", "Text to Image"],
                         value="Image to Image", label="モード",
                     )
                     with gr.Group() as reference_controls:
-                        upload_mode = gr.Radio(
-                            ["入れ替え", "追加"], value="入れ替え", label="画像の取り込み方",
-                            elem_id="upload-mode",
-                        )
-                        uploader = gr.File(
-                            file_count="multiple", file_types=["image"], interactive=True,
-                            label="参照画像をここにドロップ、またはクリックして選択（最大10枚）",
-                            height=130, elem_id="reference-upload",
-                        )
-                        reference_count = gr.Markdown("参照画像: **0 / 10枚**", elem_id="reference-count")
-                        clear_references = gr.Button(
-                            "参照画像をクリア", interactive=False, elem_classes="wb-action",
-                            elem_id="clear-references",
-                        )
-                        preview = gr.Gallery(
-                            label="参照画像プレビュー", columns=3, rows=1, height=360,
-                            interactive=False, format="png", object_fit="contain",
-                            preview=True, selected_index=0, buttons=["fullscreen"],
-                            elem_id="reference-preview",
-                        )
+                        with gr.Row():
+                            with gr.Column(min_width=170, scale=1):
+                                upload_mode = gr.Radio(
+                                    ["入れ替え", "追加"], value="入れ替え", label="画像の取り込み方",
+                                    elem_id="upload-mode",
+                                )
+                                uploader = gr.File(
+                                    file_count="multiple", file_types=["image"], interactive=True,
+                                    label="参照画像をドロップ（最大10枚）",
+                                    height=120, elem_id="reference-upload",
+                                )
+                            preview = gr.Gallery(
+                                label="参照画像", columns=3, rows=1, height=210, min_width=170,
+                                scale=1, interactive=False, format="png", object_fit="contain",
+                                preview=True, selected_index=0, buttons=["fullscreen"],
+                                elem_id="reference-preview",
+                            )
+                        with gr.Row():
+                            reference_count = gr.Markdown("参照画像: **0 / 10枚**", elem_id="reference-count")
+                            clear_references = gr.Button(
+                                "参照画像をクリア", interactive=False, elem_classes="wb-action",
+                                elem_id="clear-references", size="sm", min_width=140,
+                            )
                     prompt = gr.Textbox(
-                        label="編集・生成の指示", lines=4,
-                        placeholder="例：人物の顔と服を保ったまま、背景を夕暮れの海辺に変えてください。",
+                        label="編集・生成の指示", lines=3,
+                        placeholder="例：顔と服を保ち、背景を夕暮れの海辺に変更。",
                         elem_id="instruction",
                     )
-                    with gr.Group() as enhancement_controls:
+                    action_hint = gr.Markdown(
+                        action_availability("Image to Image", [], "", None)["reason"],
+                        elem_id="action-hint",
+                    )
+                    with gr.Row():
+                        run = gr.Button(
+                            "画像を生成", variant="primary", interactive=False,
+                            elem_classes="wb-action", elem_id="generate-button", min_width=140,
+                        )
+                        combined = gr.Button(
+                            "指示を整えてから生成", variant="primary", interactive=False,
+                            elem_classes="wb-action", elem_id="combined-button", min_width=200,
+                        )
+                    with gr.Row() as enhancement_controls:
                         enhance = gr.Button(
                             "編集指示を整える", interactive=False, elem_classes="wb-action",
-                            elem_id="enhance-button",
+                            elem_id="enhance-button", min_width=170, size="sm",
                         )
                         thorough = gr.Checkbox(
-                            value=False, label="詳しく検討する（時間がかかります）",
+                            value=False, label="詳しく検討する（時間がかかります）", min_width=200,
                         )
+                    with gr.Accordion("生成設定 · サイズ・ステップ・シード", open=False):
+                        with gr.Row():
+                            width = gr.Slider(
+                                256, 3072, value=DEFAULT_WIDTH, step=32, label="幅 (px)",
+                                min_width=170,
+                            )
+                            height = gr.Slider(
+                                256, 3072, value=DEFAULT_HEIGHT, step=32, label="高さ (px)",
+                                min_width=170,
+                            )
+                        swap = gr.Button("幅と高さを入れ替える", elem_classes="wb-action")
+                        with gr.Row():
+                            steps = gr.Slider(1, 100, value=40, step=1, label="ステップ数", min_width=170)
+                            seed = gr.Number(value=-1, precision=0, label="シード（-1: ランダム）", min_width=170)
+                        transparent = gr.Checkbox(label="透明背景を指示する（RGBA）")
                         gr.Markdown(
-                            "参照画像と指示をもとに、補助モデルが上の指示文を書き直します。"
-                            "内容を確認・修正してから「画像を生成」を押してください。\n\n"
-                            "通常モードは短い指示に整理し、補助モデルに渡す画像の解像度を抑えます。"
-                            "細部を詳しく検討したい場合は上のチェックをオンにしてください。\n\n"
-                            "初回のみ約 18.8 GB の追加ダウンロードが必要です。"
-                            "同じ画像・指示での再実行は前回の結果を再利用します。"
+                            f"初期サイズは {DEFAULT_WIDTH}×{DEFAULT_HEIGHT} px（幅×高さ）です。"
+                            "大きい画像は時間とメモリを多く使います。"
                         )
-                    with gr.Group() as example_controls:
+                    with gr.Accordion("Examples · 指示の例", open=False, elem_id="examples") as example_controls:
                         gr.Examples(
                             examples=[
                                 ["背景を夕暮れの海辺に変更。人物の顔・服・構図は維持してください。"],
@@ -221,57 +319,39 @@ def build_app():
                                 ["A small ceramic fox on a wooden desk, soft morning light."],
                             ], inputs=prompt,
                         )
-                    with gr.Accordion("生成設定", open=True):
-                        with gr.Row():
-                            width = gr.Slider(
-                                256, 3072, value=DEFAULT_WIDTH, step=32, label="幅 (px)",
-                                min_width=240,
-                            )
-                            height = gr.Slider(
-                                256, 3072, value=DEFAULT_HEIGHT, step=32, label="高さ (px)",
-                                min_width=240,
-                            )
-                        swap = gr.Button("幅と高さを入れ替える", elem_classes="wb-action")
-                        steps = gr.Slider(1, 100, value=40, step=1, label="ステップ数")
-                        seed = gr.Number(value=-1, precision=0, label="シード（-1: ランダム）")
-                        transparent = gr.Checkbox(label="透明背景を指示する（RGBA）")
+                    with gr.Accordion("使い方・指示整理について", open=False):
                         gr.Markdown(
-                            f"初期サイズは {DEFAULT_WIDTH}×{DEFAULT_HEIGHT} px（幅×高さ）です。"
-                            "大きい画像は時間とメモリを多く使います。"
+                            "**画像を生成**：入力した指示をそのまま使います。\n\n"
+                            "**指示を整えてから生成**：参照画像を見て指示を書き直し、自動で生成します。"
+                            "指示が未完成の場合は停止します。\n\n"
+                            "**編集指示を整える**：指示文だけを書き直します。確認・修正してから生成できます。\n\n"
+                            "通常は簡潔な指示を作ります。細部は「詳しく検討する」で検討できます。"
+                            "同じ画像・指示は前回の結果を再利用します。初回のみ補助モデル約18.8 GBをダウンロードします。"
                         )
-                    action_hint = gr.Markdown(
-                        action_availability("Image to Image", [], "", None)["reason"],
-                        elem_id="action-hint",
-                    )
-                    run = gr.Button(
-                        "画像を生成", variant="primary", interactive=False,
-                        elem_classes="wb-action", elem_id="generate-button",
-                    )
-                with gr.Column():
+                with gr.Column(min_width=320):
                     run_status = gr.HTML(
-                        status_card("idle", "参照画像と指示を準備して、画像を生成してください。"),
+                        status_card("idle", "参照画像と指示を準備してください。"),
                         elem_id="run-status",
                     )
                     output = gr.Image(
                         label="生成結果", type="filepath", format="png", image_mode="RGBA",
-                        interactive=False, height=520,
+                        interactive=False, height=360,
                         buttons=["download", "fullscreen"], elem_id="generated-image",
                     )
                     reuse_result = gr.Button(
                         "この生成画像を参照画像にする", interactive=False,
                         elem_classes="wb-action", elem_id="reuse-result",
                     )
-                    files = gr.File(label="PNG・生成設定をダウンロード", file_count="multiple")
-                    generation_time = gr.Textbox(
-                        label="画像生成の所要時間（直近）", value="未実行", interactive=False,
-                        elem_id="generation-time",
-                    )
-                    enhancement_time = gr.Textbox(
-                        label="指示を整える所要時間（直近）", value="未実行", interactive=False,
-                        elem_id="enhancement-time",
-                    )
+                    with gr.Row():
+                        generation_time = gr.Textbox(
+                            label="画像生成の所要時間（直近）", value="未実行", interactive=False,
+                            elem_id="generation-time", min_width=170,
+                        )
+                        enhancement_time = gr.Textbox(
+                            label="指示を整える所要時間（直近）", value="未実行", interactive=False,
+                            elem_id="enhancement-time", min_width=170,
+                        )
                     with gr.Accordion("実行ログ", open=False):
-                        gr.Markdown("この実行の進捗・警告・エラーを表示します。")
                         with gr.Row():
                             gr.Checkbox(
                                 label="最新行へ自動スクロール", value=True, interactive=True,
@@ -284,7 +364,8 @@ def build_app():
                             label="ログ（最新200行）", lines=12, max_lines=12, interactive=False,
                             autoscroll=False, buttons=["copy"], elem_id="run-log",
                         )
-                    with gr.Accordion("生成情報", open=False):
+                    with gr.Accordion("ダウンロード・生成情報", open=False):
+                        files = gr.File(label="PNG・生成設定をダウンロード", file_count="multiple")
                         info = gr.JSON(label="設定と実行結果")
             task.change(
                 lambda mode, paths: (
@@ -298,7 +379,7 @@ def build_app():
             references.change(
                 lambda paths, mode: (
                     update_reference_preview(paths, mode),
-                    f"参照画像: **{len(paths or [])} / 10枚** · 番号は取り込んだ順です。",
+                    f"参照画像: **{len(paths or [])} / 10枚**",
                 ),
                 [references, task], [preview, reference_count], queue=False, api_name=False,
             )
@@ -331,7 +412,7 @@ def build_app():
 
         editable = [task, prompt, uploader, upload_mode, thorough, width, height, steps,
                     seed, transparent, swap, unload]
-        control_outputs = [*editable, run, enhance, clear_references, reuse_result, action_hint,
+        control_outputs = [*editable, run, enhance, combined, clear_references, reuse_result, action_hint,
                            example_controls]
         control_inputs = [busy, active_operation, task, references, prompt, output]
 
@@ -344,6 +425,9 @@ def build_app():
                 )),
                 enhance: gr.update(interactive=allowed["enhance"], value=(
                     "指示を整理中…" if is_busy and operation == "enhance" else "編集指示を整える"
+                )),
+                combined: gr.update(interactive=allowed["combined"], value=(
+                    "指示整理 → 生成中…" if is_busy and operation == "combined" else "指示を整えてから生成"
                 )),
                 clear_references: gr.update(interactive=allowed["clear"]),
                 reuse_result: gr.update(interactive=allowed["reuse"]),
@@ -383,6 +467,10 @@ def build_app():
             (run, "generate", stream_generate_image,
              [task, references, prompt, width, height, steps, seed, transparent],
              [output, files, info, run_status, generation_time, run_log], "generate_image"),
+            (combined, "combined", stream_enhance_and_generate,
+             [task, references, prompt, width, height, steps, seed, transparent, thorough],
+             [prompt, output, files, info, run_status, generation_time, enhancement_time, run_log],
+             "enhance_and_generate"),
             (enhance, "enhance", stream_enhance_prompt,
              [task, references, prompt, thorough],
              [prompt, run_status, enhancement_time, run_log], "enhance_prompt"),
