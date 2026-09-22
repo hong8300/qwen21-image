@@ -43,13 +43,21 @@ def generate_image(
         handle_error(error)
 
 
-def enhance_prompt(task, references, prompt, progress=gr.Progress()):
+def enhance_prompt(task, references, prompt, thorough=False, progress=gr.Progress()):
     try:
         if task != "Image to Image":
             raise ValueError("編集指示の補助は Image to Image モードで利用してください。")
-        return manager.rewrite_prompt(references or [], prompt, progress)
+        return manager.rewrite_prompt(references or [], prompt, progress, thorough=thorough)
     except Exception as error:
         handle_error(error)
+
+
+def update_reference_preview(paths, mode):
+    return gr.update(
+        value=[(path, f"Image {i + 1}") for i, path in enumerate(paths or [])],
+        visible=mode == "Image to Image", selected_index=0 if paths else None,
+        preview=True,
+    )
 
 
 def build_app():
@@ -71,8 +79,10 @@ def build_app():
                         label="参照画像（最大 10 枚・番号はアップロード順）",
                     )
                     preview = gr.Gallery(
-                        label="参照画像プレビュー", columns=3, height=180,
-                        interactive=False, format="png", visible=False,
+                        label="参照画像プレビュー", columns=3, rows=1, height=420,
+                        interactive=False, format="png", object_fit="contain",
+                        preview=True, selected_index=0, buttons=["fullscreen"],
+                        elem_id="reference-preview",
                     )
                     prompt = gr.Textbox(
                         label="編集・生成の指示", lines=4,
@@ -80,10 +90,14 @@ def build_app():
                     )
                     with gr.Group() as enhancement_controls:
                         enhance = gr.Button("編集指示を整える")
+                        thorough = gr.Checkbox(
+                            value=False, label="詳しく検討する（時間がかかります）",
+                        )
                         gr.Markdown(
                             "参照画像と指示をもとに、補助モデルが上の指示文を書き直します。"
                             "内容を確認・修正してから「画像を生成」を押してください。\n\n"
                             "初回のみ約 18.8 GB の追加ダウンロードが必要です。"
+                            "同じ画像・指示での再実行は前回の結果を再利用します。"
                         )
                     gr.Examples(
                         examples=[
@@ -102,6 +116,7 @@ def build_app():
                                 256, 3072, value=DEFAULT_HEIGHT, step=32, label="高さ (px)",
                                 min_width=240,
                             )
+                        swap = gr.Button("幅と高さを入れ替える")
                         steps = gr.Slider(1, 100, value=40, step=1, label="ステップ数")
                         seed = gr.Number(value=-1, precision=0, label="シード（-1: ランダム）")
                         transparent = gr.Checkbox(label="透明背景を指示する（RGBA）")
@@ -114,28 +129,30 @@ def build_app():
                     output = gr.Image(
                         label="生成結果", type="filepath", format="png", image_mode="RGBA",
                         interactive=False, height=520,
+                        buttons=["download", "fullscreen"], elem_id="generated-image",
                     )
                     files = gr.File(label="PNG・生成設定をダウンロード", file_count="multiple")
                     with gr.Accordion("生成情報", open=False):
                         info = gr.JSON(label="設定と実行結果")
             task.change(
                 lambda mode, paths: (
-                    gr.File(visible=mode == "Image to Image"),
-                    gr.Gallery(visible=mode == "Image to Image" and bool(paths)),
-                    gr.Group(visible=mode == "Image to Image"),
+                    gr.update(visible=mode == "Image to Image"),
+                    update_reference_preview(paths, mode),
+                    gr.update(visible=mode == "Image to Image"),
                 ),
                 [task, references], [references, preview, enhancement_controls], queue=False,
             )
             enhance.click(
-                enhance_prompt, [task, references, prompt], prompt,
+                enhance_prompt, [task, references, prompt, thorough], prompt,
                 concurrency_limit=1, concurrency_id="inference", api_name="enhance_prompt",
             )
             references.change(
-                lambda paths, mode: gr.Gallery(
-                    value=[(path, f"Image {i + 1}") for i, path in enumerate(paths or [])],
-                    visible=mode == "Image to Image" and bool(paths),
-                ),
+                update_reference_preview,
                 [references, task], preview, queue=False,
+            )
+            swap.click(
+                lambda w, h: (h, w), [width, height], [width, height],
+                queue=False, api_name="swap_dimensions",
             )
             run.click(
                 generate_image,

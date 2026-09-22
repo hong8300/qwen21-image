@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
 import os
 import secrets
@@ -70,6 +71,8 @@ class ModelManager:
         self.pipeline = None
         self.device = None
         self.enhancer = PromptEnhancer()
+        self.rewrite_cache = {}
+        self.rewrite_stats = {}
 
     def select_device(self) -> str:
         import torch
@@ -103,24 +106,47 @@ class ModelManager:
     def unload(self) -> str:
         with self.lock:
             self._release()
+            self.rewrite_cache.clear()
         return "モデルを解放しました。次回の実行時に再読み込みします。"
 
     def rewrite_prompt(
         self, paths: list[str], prompt: str,
         progress: Callable = lambda *args, **kwargs: None,
+        *, thorough: bool = False,
     ) -> str:
         if not prompt.strip():
             raise ValueError("編集指示を入力してください。")
         if not 1 <= len(paths) <= 10:
             raise ValueError("編集する参照画像を 1〜10 枚アップロードしてください。")
         images = [read_image(path) for path in paths]
+        image_key = tuple(
+            (image.mode, image.size, hashlib.sha256(image.tobytes()).digest()) for image in images
+        )
+        prompt = prompt.strip()
+        cache_key = (image_key, prompt, thorough)
         with self.lock:
+            started = time.perf_counter()
+            if cache_key in self.rewrite_cache:
+                self.rewrite_stats = {"cache_hit": True, "total_seconds": 0.0}
+                progress(1, desc="同じ画像・指示の前回結果を再利用しました")
+                return self.rewrite_cache[cache_key]
             # Keep only one large model in memory at a time, including on MPS.
             self._release()
             try:
                 device = self.select_device()
-                progress(0, desc="編集指示を整えています（初回は補助モデルをダウンロードします）")
-                return self.enhancer.rewrite(images, prompt.strip(), device)
+                result = self.enhancer.rewrite(
+                    images, prompt, device, thorough=thorough, progress=progress,
+                )
+                # Cache only the last request and its output, so repeated clicks are idempotent.
+                self.rewrite_cache = {
+                    cache_key: result, (image_key, result, thorough): result,
+                }
+                self.rewrite_stats = {
+                    **self.enhancer.last_stats, "cache_hit": False,
+                    "total_seconds": round(time.perf_counter() - started, 2),
+                }
+                progress(1, desc="編集指示を整えました")
+                return result
             finally:
                 self._release()
 
